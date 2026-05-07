@@ -12,35 +12,34 @@ TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_FROM       = os.environ["TWILIO_FROM"]
 ALERT_TO          = os.environ["ALERT_TO"]
 
-LOCATION_ID = os.getenv("LOCATION_ID", "2084")
-SERVICE_ID  = os.getenv("SERVICE_ID",  "31156")
-VENUE_SLUG  = os.getenv("VENUE_SLUG",  "Omnifortlauderdale")
-POLL_SECS   = int(os.getenv("POLL_SECS", "30"))
-DATES       = os.getenv("DATES", "2026-05-09,2026-05-10").split(",")
+TENANT_ID    = os.getenv("TENANT_ID",    "2084")
+PROPERTY_ID  = os.getenv("PROPERTY_ID",  "Omnifortlauderdale")
+SERVICE_ID   = os.getenv("SERVICE_ID",   "31156")
+SERVICE_CODE = os.getenv("SERVICE_CODE", "MASCUS50")
+POLL_SECS    = int(os.getenv("POLL_SECS", "30"))
+DATES        = os.getenv("DATES", "2026-05-09,2026-05-10").split(",")
 
-BOOK_URL = "https://book.onagilysys.com/onecart/spa/services/{location}/{venue}?date={date}&serviceId={service}"
+SLOT_URL = (
+    "https://book.onagilysys.com/wbe-spa-service/spa/tenants/{tenant}"
+    "/propertyId/{property}/v2/serviceId/{service}/date/{date}"
+    "/therapistSlotDetails?appName=spa&serviceCode={code}"
+)
 
-API_PATTERNS = [
-    "https://book.onagilysys.com/onecart/api/spa/{location}/availability?date={date}&serviceId={service}",
-    "https://book.onagilysys.com/onecart/api/services/{service}/availability?locationId={location}&date={date}",
-    "https://book.onagilysys.com/onecart/api/v2/locations/{location}/services/{service}/timeslots?date={date}",
-    "https://book.onagilysys.com/onecart/api/v1/spa/availability?locationId={location}&serviceId={service}&date={date}",
-    "https://book.onagilysys.com/onecart/api/availability?locationId={location}&serviceId={service}&date={date}",
-    "https://book.onagilysys.com/onecart/api/v1/locations/{location}/services/{service}/slots?date={date}",
-    "https://book.onagilysys.com/onecart/api/v1/services/{service}/slots?locationId={location}&date={date}",
-]
+BOOK_URL = (
+    "https://book.onagilysys.com/onecart/spa/services/{tenant}"
+    "/{property}?date={date}&serviceId={service}"
+)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/html, */*",
+    "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://book.onagilysys.com/",
+    "Referer": "https://book.onagilysys.com/onecart/spa/services/2084/Omnifortlauderdale",
     "Origin": "https://book.onagilysys.com",
 }
 
 last_state = {d: "unknown" for d in DATES}
 alerted    = {d: False for d in DATES}
-api_url_found = {}
 
 twilio = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
 
@@ -51,76 +50,46 @@ def send_sms(body):
     except Exception as e:
         log.error(f"SMS failed: {e}")
 
-def try_api_endpoints(date):
-    patterns = [api_url_found[date]] if date in api_url_found else API_PATTERNS
-    for pattern in patterns:
-        url = pattern.format(location=LOCATION_ID, service=SERVICE_ID, date=date, venue=VENUE_SLUG)
-        try:
-            r = requests.get(url, headers={**HEADERS, "Accept": "application/json"}, timeout=12)
-            body = r.text.strip()
-            if r.status_code == 200 and body and body[0] in ("{", "["):
-                api_url_found[date] = pattern
-                data = r.json()
-                slots = []
-                if isinstance(data, list):
-                    slots = data
-                elif isinstance(data, dict):
-                    for key in ("slots", "availableSlots", "timeSlots", "data", "results", "times", "appointments"):
-                        if isinstance(data.get(key), list):
-                            slots = data[key]
-                            break
-                    if not slots:
-                        avail = data.get("available") or data.get("isAvailable")
-                        if avail is True: return True, "API reports available"
-                        if avail is False: return False, "API reports unavailable"
-                if slots:
-                    times = [str(s.get("time") or s.get("startTime") or s.get("displayTime") or "") for s in slots[:5]]
-                    return True, ", ".join(t for t in times if t) or f"{len(slots)} slot(s)"
-                if isinstance(slots, list) and len(slots) == 0:
-                    return False, "empty slots array"
-        except Exception:
-            continue
-    return None, "no_api_match"
-
-def check_page_html(date):
-    url = BOOK_URL.format(location=LOCATION_ID, venue=VENUE_SLUG, date=date, service=SERVICE_ID)
+def check_date(date):
+    url = SLOT_URL.format(tenant=TENANT_ID, property=PROPERTY_ID, service=SERVICE_ID, date=date, code=SERVICE_CODE)
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
-        html = r.text.lower()
-        negative = ["no availability", "no times available", "fully booked", "sold out", "no appointments available", "unavailable for this date", "no openings", "nothing available"]
-        positive = ["select a time", "choose a time", "book now", "add to cart", "9:00 am", "10:00 am", "11:00 am", "1:00 pm", "2:00 pm", "3:00 pm", "select time", "available times"]
-        neg_hits = [k for k in negative if k in html]
-        pos_hits = [k for k in positive if k in html]
-        if neg_hits: return False, f"page says: {neg_hits[0]}"
-        if pos_hits: return True, f"page shows: {pos_hits[0]}"
-        return None, "ambiguous — JS-rendered page"
+        r.raise_for_status()
+        data = r.json()
     except Exception as e:
-        return None, f"page error: {e}"
+        log.warning(f"[{date}] Request error: {e}")
+        return
 
-def check_date(date):
-    result, detail = try_api_endpoints(date)
-    if result is None:
-        result, detail = check_page_html(date)
-    if result is True:
+    therapists = data.get("therapist", [])
+
+    if therapists:
+        times = []
+        for t in therapists:
+            name = t.get("therapistName", "")
+            slots = t.get("slots", t.get("timeSlots", t.get("availableSlots", [])))
+            for s in slots[:3]:
+                st = s.get("startTime") or s.get("time") or s.get("slot", "")
+                if st:
+                    times.append(f"{name} @ {st}" if name else str(st))
+        detail = ", ".join(times[:5]) if times else f"{len(therapists)} therapist(s) available"
+
         if not alerted[date]:
             alerted[date] = True
             last_state[date] = "available"
-            book_link = BOOK_URL.format(location=LOCATION_ID, venue=VENUE_SLUG, date=date, service=SERVICE_ID)
-            send_sms(f"Omni Spa slot open!\nDate: {date}\nDetails: {detail}\nBook: {book_link}")
+            book_link = BOOK_URL.format(tenant=TENANT_ID, property=PROPERTY_ID, date=date, service=SERVICE_ID)
+            send_sms(f"Omni Spa slot open!\nDate: {date}\n{detail}\nBook: {book_link}")
             log.info(f"[{date}] AVAILABLE — {detail}")
         else:
             log.info(f"[{date}] Still available — SMS already sent")
-    elif result is False:
+    else:
         if last_state[date] != "unavailable":
-            log.info(f"[{date}] Not available ({detail})")
+            log.info(f"[{date}] No slots available")
         last_state[date] = "unavailable"
         alerted[date] = False
-    else:
-        log.warning(f"[{date}] Unknown: {detail}")
 
 def main():
-    log.info("Omni Spa Monitor v2 | Dates: " + ", ".join(DATES))
-    send_sms(f"Spa monitor v2 running.\nWatching: {', '.join(DATES)}\nWill text when slot opens.")
+    log.info(f"Omni Spa Monitor v3 | Dates: {', '.join(DATES)} | Interval: {POLL_SECS}s")
+    send_sms(f"Spa monitor v3 running.\nWatching: {', '.join(DATES)}\nWill text when slot opens.")
     while True:
         for date in DATES:
             check_date(date)
