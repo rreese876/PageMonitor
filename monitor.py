@@ -54,7 +54,7 @@ def send_sms(body):
 def check_date(date):
     url = SLOT_URL.format(tenant=TENANT_ID, property=PROPERTY_ID, service=SERVICE_ID, date=date, code=SERVICE_CODE)
     try:
-        r = requests.get(url, headers=get_headers(), timeout=15)
+        r = requests.put(url, json={}, headers=get_headers(), timeout=15)
         if r.status_code == 401:
             log.error(f"[{date}] 401 — token expired. Update WBE_TOKEN + WBE_SESSION in Railway.")
             send_sms("Spa monitor: token expired.\nUpdate WBE_TOKEN + WBE_SESSION in Railway Variables.\nGet fresh values from Chrome DevTools on the booking page.")
